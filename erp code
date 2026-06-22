@@ -1,0 +1,747 @@
+// ═══════════════════════════════════════════════════════════════
+//  RHV HOSPITAL — ERP APPS SCRIPT BACKEND  v4.1
+//  Reads Finance Master Template → serves JSON to ERP Dashboard
+// ═══════════════════════════════════════════════════════════════
+//
+//  ╔══════════════════════════════════════════════════════════╗
+//  ║  DEPLOYMENT CHECKLIST (read every time you redeploy)    ║
+//  ╠══════════════════════════════════════════════════════════╣
+//  ║  1. Open Finance Master Template in Google Sheets        ║
+//  ║  2. Extensions → Apps Script                            ║
+//  ║  3. Paste this file into Code.gs (replace all)          ║
+//  ║  4. Click SAVE (floppy disk icon or Ctrl+S)             ║
+//  ║  5. Run testDeploy() — check logs for ✅ marks          ║
+//  ║  6. Deploy → NEW DEPLOYMENT (not manage existing)       ║
+//  ║     OR: Deploy → Manage → Edit → NEW VERSION → Deploy   ║
+//  ║  7. Settings:                                           ║
+//  ║       Execute as: Me                                    ║
+//  ║       Who has access: Anyone                            ║
+//  ║  8. Copy the /exec URL                                  ║
+//  ║  9. In ERP Dashboard → Settings → paste the URL → Save ║
+//  ║ 10. Click Test Connection — should show ✅ Connected    ║
+//  ╠══════════════════════════════════════════════════════════╣
+//  ║  COMMON CAUSES OF 401 UNAUTHORIZED:                     ║
+//  ║  • Script not redeployed after editing                  ║
+//  ║  • Old /exec URL still saved in dashboard Settings      ║
+//  ║  • "Execute as" not set to "Me"                         ║
+//  ║  • "Who has access" not set to "Anyone"                 ║
+//  ║  • Copied /dev URL instead of /exec URL                 ║
+//  ╚══════════════════════════════════════════════════════════╝
+//
+//  TOKENS (used by dashboard to authenticate):
+//    Admin:    rhv-admin-2024
+//    Revenue:  rhv-revenue-2024
+//    Store:    rhv-store-2024
+//    Payables: rhv-payables-2024
+//
+const CONFIG = {
+  TOKENS: {
+    'rhv-admin-2024':       'admin',
+    'rhv-revenue-2024':     'revenue',
+    'rhv-store-2024':       'store',
+    'rhv-payables-2024':    'payables',
+    'rhv-procurement-2024': 'procurement',
+    'rhv-pharmacy-2024':    'pharmacy',
+    'rhv-lab-2024':         'lab',
+    'rhv-radiology-2024':   'radiology',
+    'rhv-ophthal-2024':     'ophthal',
+    'rhv-cssd-2024':        'cssd'
+  },
+  CACHE_SECONDS: 300,
+  AUDIT_SHEET:   'Audit Log',
+  SHEETS: {
+    REV_2024: '📅 2024 Report',
+    REV_2025: '📅 2025 Report',
+    REV_2026: '📅 2026 Report',
+    DEPT_REV: '💰 Revenue by Department',
+    DEPT_EXP: '💸 Expenses by Dept',
+    DEBTORS:  '🏦 Debtors Tracker',
+    STORE:    '🏪 Store KPIs',
+    KPI:      '📊 KPI Scorecard',
+    CASHBOOK: 'Cashbook',
+    PAYABLES: 'Accounts Payable',
+    SRV:      'SRV Report',
+    ASSETS:   'Asset Register',
+    BILLING:  'Billing Register'
+  }
+};
+
+// ── ENTRY POINT ─────────────────────────────────────────────────
+// IMPORTANT: Deploy as Web App → Execute as: Me → Who has access: Anyone
+// After ANY code change: Deploy → Manage Deployments → Edit → New Version → Deploy
+function doGet(e) {
+  // Defensive guard: e can be undefined when run from script editor
+  e = e || {};
+  e.parameter = e.parameter || {};
+
+  const token  = e.parameter.token  || '';
+  const action = e.parameter.action || '';
+
+  // No token + no action = direct browser visit -> SERVE THE DASHBOARD
+  if (!token && !action) {
+    try {
+      return HtmlService
+        .createHtmlOutputFromFile('Dashboard')
+        .setTitle('RHV Hospital ERP Dashboard')
+        .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+        .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+    } catch (htmlErr) {
+      // Dashboard HTML file not found in this project
+      return HtmlService.createHtmlOutput(
+        '<div style="font-family:sans-serif;max-width:560px;margin:60px auto;padding:30px;border:1px solid #ddd;border-radius:10px">' +
+        '<h2 style="color:#C0392B">⚠️ Dashboard file missing</h2>' +
+        '<p>The API is running, but you need to add the dashboard HTML to this project:</p>' +
+        '<ol style="line-height:1.9">' +
+        '<li>In the Apps Script editor, click the <b>+</b> next to "Files"</li>' +
+        '<li>Choose <b>HTML</b></li>' +
+        '<li>Name it exactly: <b>Dashboard</b> (no .html)</li>' +
+        '<li>Delete the default content, paste the full RHV dashboard HTML</li>' +
+        '<li>Save, then <b>Deploy → Manage Deployments → Edit → New Version</b></li>' +
+        '</ol></div>'
+      );
+    }
+  }
+
+  try {
+    const role = validateToken(token);
+    if (!role) return jsonOut({ error: 'Unauthorized', code: 401,
+      hint: 'Token must be one of: rhv-admin-2024, rhv-revenue-2024, rhv-store-2024, rhv-payables-2024' });
+    const year  = e.parameter.year  || '2025';
+    const dept  = e.parameter.dept  || '';
+    const month = parseInt(e.parameter.month || '-1');
+    logAudit(role, action || 'all', dept);
+    const result = dispatch(action || 'all', role, year, dept, month, e.parameter);
+    return jsonOut(result);
+  } catch (err) {
+    return jsonOut({ error: err.message, line: err.lineNumber || 'unknown' });
+  }
+}
+
+// ── TEST FUNCTION ────────────────────────────────────────────────
+// Run testDeploy() from the editor to verify everything works before sharing URL
+function testDeploy() {
+  Logger.log('=== RHV ERP DEPLOY TEST ===');
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    Logger.log('✅ Spreadsheet: ' + ss.getName());
+    Logger.log('   Sheets: ' + ss.getSheets().map(s => s.getName()).join(', '));
+  } catch(e) {
+    Logger.log('❌ Spreadsheet error: ' + e.message);
+    return;
+  }
+
+  // Test each token
+  const tests = [
+    { token: 'rhv-admin-2024',    label: 'Admin' },
+    { token: 'rhv-revenue-2024',  label: 'Revenue' },
+    { token: 'rhv-store-2024',    label: 'Store' },
+    { token: 'rhv-payables-2024', label: 'Payables' },
+  ];
+  tests.forEach(t => {
+    const role = validateToken(t.token);
+    if (role) {
+      Logger.log('✅ Token valid: ' + t.label + ' → role: ' + role);
+    } else {
+      Logger.log('❌ Token INVALID: ' + t.label);
+    }
+  });
+
+  // Test a full payload build
+  try {
+    const fakeE = { parameter: { token: 'rhv-admin-2024', action: 'all', year: '2025' } };
+    const result = doGet(fakeE);
+    Logger.log('✅ doGet() works — response type: ' + typeof result);
+  } catch(e) {
+    Logger.log('❌ doGet() error: ' + e.message);
+  }
+
+  Logger.log('');
+  Logger.log('=== NEXT STEPS ===');
+  Logger.log('If all checks passed:');
+  Logger.log('  Deploy → Manage Deployments → Edit → New Version → Deploy');
+  Logger.log('  Copy the /exec URL');
+  Logger.log('  Paste it in the ERP Dashboard → Settings → Apps Script URL');
+}
+
+function dispatch(action, role, year, dept, month, params) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  switch (action) {
+    case 'all':         return buildFullPayload(ss, role, year);
+    case 'dept':        return buildDeptDrilldown(ss, role, dept, year);
+    case 'weekly':      return buildWeeklyPayload(ss, year, month);
+    case 'kpis':        return buildKPIPayload(ss, year);
+    case 'store':       return buildStorePayload(ss, role);
+    case 'payables':    return buildPayablesPayload(ss, role);
+    case 'billing':     return buildBillingPayload(ss, role);
+    case 'vendors':     return buildVendorPayload(ss, role);
+    case 'assets':      return buildAssetPayload(ss, role);
+    case 'archive':     return buildArchivePayload(ss, role, params.period);
+    case 'sheets':      return detectSheets(ss, role);
+    default:            return buildFullPayload(ss, role, year);
+  }
+}
+
+// ── AUTH ─────────────────────────────────────────────────────────
+function validateToken(token) {
+  return CONFIG.TOKENS[token] || null;
+}
+
+// ── POST HANDLER: receives form data from dashboard, writes to Sheets ──
+// Frontend sends JSON: { token, action:'append', sheet:'<SheetName>', record:{...} }
+//                  or: { token, action:'email', to, subject, html }
+function doPost(e) {
+  try {
+    var body = {};
+    try { body = JSON.parse(e.postData.contents); } catch (parseErr) { body = e.parameter || {}; }
+
+    var role = validateToken(body.token || '');
+    if (!role) return jsonOut({ ok:false, error:'Unauthorized', code:401 });
+
+    var action = body.action || 'append';
+
+    if (action === 'email') {
+      return jsonOut(sendDocEmail(body.to, body.subject, body.html));
+    }
+
+    if (action === 'append') {
+      return jsonOut(appendRecord(body.sheet, body.record, role));
+    }
+
+    return jsonOut({ ok:false, error:'Unknown action: ' + action });
+  } catch (err) {
+    return jsonOut({ ok:false, error: err.message });
+  }
+}
+
+// Append a record object to a sheet (auto-creates sheet + header row)
+function appendRecord(sheetName, record, role) {
+  if (!sheetName || !record) return { ok:false, error:'Missing sheet or record' };
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(sheetName);
+  var keys = Object.keys(record);
+
+  if (!sh) {
+    sh = ss.insertSheet(sheetName);
+    sh.appendRow(['Timestamp'].concat(keys));
+    sh.getRange(1,1,1,keys.length+1).setFontWeight('bold').setBackground('#1B4F72').setFontColor('#FFFFFF');
+  }
+
+  // Align to existing header order if present
+  var lastCol = sh.getLastColumn();
+  var header = lastCol > 0 ? sh.getRange(1,1,1,lastCol).getValues()[0] : [];
+  if (header.length === 0) {
+    header = ['Timestamp'].concat(keys);
+    sh.appendRow(header);
+  }
+
+  var row = header.map(function(col){
+    if (col === 'Timestamp') return new Date();
+    return record[col] != null ? record[col] : '';
+  });
+  // include any new keys not in header (append columns)
+  keys.forEach(function(k){
+    if (header.indexOf(k) === -1) {
+      sh.getRange(1, sh.getLastColumn()+1).setValue(k).setFontWeight('bold').setBackground('#1B4F72').setFontColor('#FFFFFF');
+      row.push(record[k]);
+    }
+  });
+
+  sh.appendRow(row);
+  logAudit(role, 'POST append', sheetName);
+  return { ok:true, sheet:sheetName, savedRow: sh.getLastRow() };
+}
+
+// Send an invoice/receipt/PO via email (HTML body)
+function sendDocEmail(to, subject, html) {
+  if (!to) return { ok:false, error:'No recipient email' };
+  try {
+    MailApp.sendEmail({ to: to, subject: subject || 'RHV Hospital Document', htmlBody: html || '' });
+    return { ok:true, sentTo: to };
+  } catch (err) {
+    return { ok:false, error: err.message };
+  }
+}
+
+// ── JSON RESPONSE ─────────────────────────────────────────────────
+function jsonOut(data) {
+  return ContentService
+    .createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ── FULL DASHBOARD PAYLOAD ─────────────────────────────────────────
+function buildFullPayload(ss, role, year) {
+  const cache = CacheService.getScriptCache();
+  const cKey  = `full_${role}_${year}`;
+  const cached = cache.get(cKey);
+  if (cached) return JSON.parse(cached);
+
+  const payload = {
+    meta: {
+      workbook:  ss.getName(),
+      timestamp: new Date().toISOString(),
+      year,
+      role,
+      sheets:    ss.getSheets().map(s => s.getName())
+    },
+    revenue:    getRevenueData(ss, year),
+    expenses:   getExpenseData(ss, year),
+    streams:    getStreams(ss, year),
+    depts:      getDeptSummaries(ss, year),
+    debtors:    getDebtors(ss),
+    cashbook:   getCashbook(ss, year),
+    kpis:       getKPIs(ss, year),
+    store:      role === 'revenue' ? null : getStoreData(ss),
+    payables:   (role === 'admin' || role === 'payables') ? getPayables(ss) : null,
+    billing:    (role === 'admin' || role === 'revenue')  ? getBilling(ss)  : null,
+    vendors:    getVendors(ss),
+    assets:     getAssets(ss)
+  };
+
+  try { cache.put(cKey, JSON.stringify(payload), CONFIG.CACHE_SECONDS); } catch(e) {}
+  return payload;
+}
+
+// ── REVENUE DATA ───────────────────────────────────────────────────
+function getRevenueData(ss, year) {
+  const names = { '2024': CONFIG.SHEETS.REV_2024, '2025': CONFIG.SHEETS.REV_2025, '2026': CONFIG.SHEETS.REV_2026 };
+  const result = {};
+  ['2024','2025','2026'].forEach(yr => {
+    const sh = ss.getSheetByName(names[yr]);
+    if (!sh) { result[yr] = Array(12).fill(0); return; }
+    const vals = sh.getDataRange().getValues();
+    const row  = findRow(vals, 'TOTAL REVENUE', 2);
+    const exp  = findRow(vals, 'TOTAL EXPENDITURE', 2);
+    const sur  = findRow(vals, 'NET SURPLUS', 2);
+    const tgt  = findRow(vals, 'MONTHLY TARGET', 2);
+    result[yr] = {
+      monthly:  row >= 0 ? numSlice(vals[row], 3, 15) : Array(12).fill(0),
+      expenses: exp >= 0 ? numSlice(vals[exp], 3, 15) : Array(12).fill(0),
+      surplus:  sur >= 0 ? numSlice(vals[sur], 3, 15) : Array(12).fill(0),
+      target:   tgt >= 0 ? (Number(vals[tgt][3]) || 120000000) : 120000000
+    };
+  });
+  return result;
+}
+
+// ── INDIVIDUAL STREAMS ─────────────────────────────────────────────
+function getStreams(ss, year) {
+  const names = { '2024': CONFIG.SHEETS.REV_2024, '2025': CONFIG.SHEETS.REV_2025, '2026': CONFIG.SHEETS.REV_2026 };
+  const sh = ss.getSheetByName(names[year] || CONFIG.SHEETS.REV_2025);
+  if (!sh) return [];
+  const vals = sh.getDataRange().getValues();
+  const streams = [];
+  let inRev = false;
+  for (let i = 0; i < vals.length; i++) {
+    const c2 = String(vals[i][2] || '').trim();
+    const c1 = vals[i][1];
+    if (c2.toUpperCase().includes('SECTION A')) { inRev = true; continue; }
+    if (c2.toUpperCase().includes('TOTAL REVENUE')) { inRev = false; continue; }
+    if (!inRev || !c2 || c2 === 'REVENUE STREAM') continue;
+    if (typeof c1 === 'number' || !isNaN(parseInt(c1))) {
+      const monthly = numSlice(vals[i], 3, 15);
+      const ytd     = Number(vals[i][15]) || monthly.reduce((a,b)=>a+b,0);
+      if (ytd > 0 || monthly.some(v=>v>0)) streams.push({ name: c2, monthly, ytd, dept: guessDept(c2) });
+    }
+  }
+  return streams.sort((a,b) => b.ytd - a.ytd);
+}
+
+function guessDept(name) {
+  const n = name.toLowerCase();
+  if (n.includes('lab'))       return 'Laboratory';
+  if (n.includes('surg'))      return 'Theatre & Surgery';
+  if (n.includes('drug') || n.includes('pharm') || n.includes('consumable') || n.includes('fluid')) return 'Pharmacy';
+  if (n.includes('radio') || n.includes('ct') || n.includes('mri') || n.includes('ultrasound') || n.includes('x-ray')) return 'Radiology';
+  if (n.includes('dialysis'))  return 'Dialysis';
+  if (n.includes('physio'))    return 'Physiotherapy';
+  if (n.includes('card'))      return 'Cardiology';
+  if (n.includes('ophthal') || n.includes('eye')) return 'Ophthalmology';
+  if (n.includes('consult') || n.includes('opd') || n.includes('outpatient')) return 'Outpatient';
+  if (n.includes('bed') || n.includes('admission') || n.includes('nurs') || n.includes('ward') || n.includes('inpatient')) return 'Inpatient';
+  if (n.includes('icu'))       return 'ICU / HDU';
+  if (n.includes('dental') || n.includes('ent') || n.includes('oxygen') || n.includes('ambulance') || n.includes('diet')) return 'Other Clinical';
+  return 'Other';
+}
+
+// ── DEPT SUMMARIES ─────────────────────────────────────────────────
+function getDeptSummaries(ss, year) {
+  const streams = getStreams(ss, year);
+  const deptMap = {};
+  streams.forEach(s => {
+    const d = s.dept;
+    if (!deptMap[d]) deptMap[d] = { name: d, streams: [], monthly: Array(12).fill(0), ytd: 0 };
+    deptMap[d].streams.push(s.name);
+    s.monthly.forEach((v,i) => deptMap[d].monthly[i] += v);
+    deptMap[d].ytd += s.ytd;
+  });
+  return Object.values(deptMap).sort((a,b) => b.ytd - a.ytd);
+}
+
+// ── DEPT DRILL-DOWN ────────────────────────────────────────────────
+function buildDeptDrilldown(ss, role, deptName, year) {
+  const streams     = getStreams(ss, year);
+  const allExp      = getExpenseData(ss, year);
+  const deptStreams  = streams.filter(s => s.dept === deptName);
+  const monthly     = Array(12).fill(0);
+  deptStreams.forEach(s => s.monthly.forEach((v,i) => monthly[i] += v));
+  const ytd         = monthly.reduce((a,b) => a+b, 0);
+  const totalRev    = streams.reduce((s,x) => s+x.ytd, 0);
+  const deptShare   = totalRev > 0 ? ytd / totalRev : 0;
+  const deptExpYTD  = (allExp.expenses2025total || 0) * deptShare;
+  const deptExpMo   = (allExp.y2025?.expenses || Array(12).fill(0)).map(v => v * deptShare);
+  const deptSurplus = monthly.map((v,i) => v - deptExpMo[i]);
+  const margin      = ytd > 0 ? ((ytd - deptExpYTD) / ytd * 100) : 0;
+  const weeklyByMonth = monthly.map((v, mi) => ({
+    month: mi,
+    weeks: [
+      { week: 1, dates: '1–7',   rev: Math.round(v * 0.19) },
+      { week: 2, dates: '8–14',  rev: Math.round(v * 0.22) },
+      { week: 3, dates: '15–21', rev: Math.round(v * 0.25) },
+      { week: 4, dates: '22–28', rev: Math.round(v * 0.28) },
+      { week: 5, dates: '29–31', rev: Math.round(v * 0.06) }
+    ]
+  }));
+  return { dept: deptName, year, streams: deptStreams, monthly, ytd,
+    expenses: { monthly: deptExpMo, ytd: deptExpYTD },
+    surplus:  { monthly: deptSurplus, ytd: deptSurplus.reduce((a,b)=>a+b,0) },
+    margin: +margin.toFixed(1), share: +(deptShare*100).toFixed(1), weeklyByMonth };
+}
+
+// ── EXPENSE DATA ───────────────────────────────────────────────────
+function getExpenseData(ss, year) {
+  const names = { '2024': CONFIG.SHEETS.REV_2024, '2025': CONFIG.SHEETS.REV_2025, '2026': CONFIG.SHEETS.REV_2026 };
+  const sh = ss.getSheetByName(names[year] || CONFIG.SHEETS.REV_2025);
+  const result = { y2025: { expenses: Array(12).fill(0) }, expenses2025total: 0 };
+  if (!sh) return result;
+  const vals = sh.getDataRange().getValues();
+  const row  = findRow(vals, 'TOTAL EXPENDITURE', 2);
+  if (row >= 0) {
+    const monthly = numSlice(vals[row], 3, 15);
+    result.y2025 = { expenses: monthly };
+    result.expenses2025total = monthly.reduce((a,b)=>a+b,0);
+  }
+  const CATS = ['STAFF','MEDICAL SUPPLIES','UTILITIES','ADMIN','REPAIRS','CAPITAL'];
+  const cats = {};
+  CATS.forEach(cat => {
+    const r = findRow(vals, cat, 2);
+    if (r >= 0) cats[cat] = numSlice(vals[r], 3, 15).reduce((a,b)=>a+b,0);
+  });
+  result.categories = cats;
+  return result;
+}
+
+// ── WEEKLY PAYLOAD ─────────────────────────────────────────────────
+function buildWeeklyPayload(ss, year, month) {
+  const rev = getRevenueData(ss, year);
+  const mo  = rev[year]?.monthly || Array(12).fill(0);
+  const exp = rev[year]?.expenses || Array(12).fill(0);
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const QNAMES = { 0:'Q1',1:'Q1',2:'Q1',3:'Q2',4:'Q2',5:'Q2',6:'Q3',7:'Q3',8:'Q3',9:'Q4',10:'Q4',11:'Q4' };
+  const monthly = mo.map((v,i) => ({
+    month: i, monthName: MONTHS[i], revenue: v, expenses: exp[i], surplus: v-exp[i],
+    ratio: v>0 ? +((exp[i]/v)*100).toFixed(1) : 0, quarter: QNAMES[i]
+  }));
+  const weeks = [];
+  mo.forEach((mRev, mi) => {
+    const mExp = exp[mi];
+    [0.19,0.22,0.25,0.28,0.06].forEach((pct,wi) => {
+      weeks.push({ weekNum: wi+1, month: mi, monthName: MONTHS[mi], year: parseInt(year),
+        quarter: QNAMES[mi], revenue: Math.round(mRev*pct), expenses: Math.round(mExp*pct),
+        surplus: Math.round((mRev-mExp)*pct), label: `${MONTHS[mi]} W${wi+1}` });
+    });
+  });
+  const quarters = {};
+  monthly.forEach(m => {
+    const q = m.quarter;
+    if (!quarters[q]) quarters[q] = { q, revenue:0, expenses:0, surplus:0 };
+    quarters[q].revenue  += m.revenue;
+    quarters[q].expenses += m.expenses;
+    quarters[q].surplus  += m.surplus;
+  });
+  return { year, monthly, weeks, quarters: Object.values(quarters) };
+}
+
+// ── DEBTORS ────────────────────────────────────────────────────────
+function getDebtors(ss) {
+  const sh = ss.getSheetByName(CONFIG.SHEETS.DEBTORS);
+  if (!sh) return { found: false };
+  const vals = sh.getDataRange().getValues();
+  const headers = vals[1] ? vals[1].slice(3,11).map(v=>String(v).trim()).filter(Boolean) : [];
+  const categories = [], data = [];
+  const SKIP = ['TOTAL','ACTION','PRIORITY','PATIENT','DEBTOR','CATEGORY','S/N'];
+  for (let i=2; i<vals.length; i++) {
+    const cat = String(vals[i][2]||'').trim();
+    if (!cat || SKIP.some(w=>cat.toUpperCase().includes(w))) continue;
+    categories.push(cat);
+    data.push(numSlice(vals[i], 3, 11));
+  }
+  const tr = findRow(vals, 'TOTAL OUTSTANDING', 2);
+  const totals = tr>=0 ? numSlice(vals[tr], 3, 11) : headers.map((_,ci)=>data.reduce((s,r)=>s+(r[ci]||0),0));
+  const latest = totals.filter(v=>v>0).slice(-1)[0]||0;
+  const prev   = totals.filter(v=>v>0).slice(-2,-1)[0]||0;
+  return { found:true, categories, months:headers, data, totals, latest, prev,
+    growth: prev>0 ? +((latest-prev)/prev*100).toFixed(1) : 0 };
+}
+
+// ── CASHBOOK ───────────────────────────────────────────────────────
+function getCashbook(ss, year) {
+  const sh = ss.getSheetByName(CONFIG.SHEETS.CASHBOOK);
+  if (!sh) return { found: false };
+  const vals = sh.getDataRange().getValues();
+  if (vals.length < 2) return { found:true, rows:[], summary:{} };
+  const h = vals[0].map(c=>String(c).toLowerCase());
+  const ci = {
+    date: fci(h,'date'), desc: fci(h,'desc','narration','particular'),
+    rec:  fci(h,'receipt','credit','income'), pay: fci(h,'payment','debit','expenditure'),
+    bal:  fci(h,'balance','running')
+  };
+  const rows = []; let tR=0, tP=0;
+  for (let i=1; i<vals.length; i++) {
+    const r=Number(vals[i][ci.rec])||0, p=Number(vals[i][ci.pay])||0;
+    if (r===0&&p===0) continue;
+    tR+=r; tP+=p;
+    rows.push({ date:ci.date>=0?String(vals[i][ci.date]||''):'', desc:ci.desc>=0?String(vals[i][ci.desc]||''):'',
+      receipt:r, payment:p, balance:ci.bal>=0?Number(vals[i][ci.bal])||0:0 });
+  }
+  return { found:true, rows:rows.slice(-50),
+    summary:{ totalReceipts:tR, totalPayments:tP, closingBalance:rows.length?rows[rows.length-1].balance||tR-tP:tR-tP, count:rows.length } };
+}
+
+// ── STORE ──────────────────────────────────────────────────────────
+function getStoreData(ss) {
+  const sh = ss.getSheetByName(CONFIG.SHEETS.STORE);
+  if (!sh) return { found: false };
+  const vals = sh.getDataRange().getValues();
+  const inputs = {}; let inSec = false;
+  for (let i=0; i<vals.length; i++) {
+    const c = String(vals[i][2]||'').trim();
+    if (c.toUpperCase().includes('STORE INPUT ASSUMPTIONS')) { inSec=true; continue; }
+    if (!inSec||!c||c.toUpperCase()==='ASSUMPTION') continue;
+    inputs[c] = { unit:String(vals[i][3]||''), values:numSlice(vals[i],4,8) };
+  }
+  const g = (k,idx) => (inputs[k]&&inputs[k].values[idx])||0;
+  const kpis = {};
+  for (let mo=0; mo<4; mo++) {
+    const cogs=g('Cost of Goods Sold (COGS) – Monthly',mo);
+    const oI=g('Opening Inventory Value',mo), cI=g('Closing Inventory Value',mo), aI=(oI+cI)/2||1;
+    const cA=g('Critical Drug List: Items Available',mo), cR=g('Critical Drug List: Items Required',mo)||1;
+    const sP=g('Supplier Invoices Paid On Time',mo), sT=g('Total Supplier Invoices',mo)||1;
+    const rF=g('Requisitions Fulfilled',mo), rT=g('Total Requisitions Received',mo)||1;
+    kpis[mo] = { month:['Nov 2025','Dec 2025','Jan 2026','Feb 2026'][mo],
+      inventoryTurnover: cogs>0?+(cogs/aI*12).toFixed(2):null,
+      daysInventory:     cogs>0?+(aI/cogs*365).toFixed(0):null,
+      criticalAvail:     +(cA/cR*100).toFixed(1),
+      supplierCompliance:+(sP/sT*100).toFixed(1),
+      reqFulfillment:    +(rF/rT*100).toFixed(1),
+      expiredRatio:      oI>0?+(g('Value of Expired Stock Written Off',mo)/oI*100).toFixed(2):0,
+      drugsPurchased:    g('Total Drugs Purchased',mo),
+      consPurchased:     g('Total Medical Consumables Purchased',mo) };
+  }
+  return { found:true, kpis, inputs };
+}
+
+// ── KPIs ───────────────────────────────────────────────────────────
+function getKPIs(ss, year) {
+  const sh = ss.getSheetByName(CONFIG.SHEETS.KPI);
+  const ratings = [];
+  if (sh) {
+    const vals = sh.getDataRange().getValues();
+    for (let i=4; i<vals.length; i++) {
+      const kpi=String(vals[i][2]||'').trim(), rating=String(vals[i][9]||'').trim();
+      if (kpi&&rating&&!kpi.startsWith('  '))
+        ratings.push({ kpi, v24:String(vals[i][4]||''), v25:String(vals[i][5]||''),
+          v26:String(vals[i][6]||''), target:String(vals[i][7]||''), rating });
+    }
+  }
+  const rev=getRevenueData(ss, year||'2025');
+  const mo=rev['2025']?.monthly||Array(12).fill(0);
+  const ex=rev['2025']?.expenses||Array(12).fill(0);
+  const tRev=mo.reduce((a,b)=>a+b,0), tExp=ex.reduce((a,b)=>a+b,0);
+  const deb=getDebtors(ss);
+  const latDeb=deb.latest||0, latRev=mo[10]||mo.filter(v=>v>0).slice(-1)[0]||1;
+  const dynKPIs = [
+    { kpi:'Total Revenue (YTD)',        value:fmtCur(tRev),   target:'₦1.44B',   status:tRev>1200000000?'🟢':'🟡' },
+    { kpi:'Debtor / Revenue Ratio',     value:(latDeb/latRev*100).toFixed(1)+'%', target:'<20%', status:latDeb/latRev<0.2?'🟢':'🔴' },
+    { kpi:'Estimated Gross Margin',     value:tRev>0?((tRev-tExp*0.52)/tRev*100).toFixed(1)+'%':'—', target:'>45%', status:tRev>0&&(tRev-tExp*0.52)/tRev>0.45?'🟢':'🟡' },
+    { kpi:'Operating Margin',           value:tRev>0?((tRev-tExp)/tRev*100).toFixed(1)+'%':'—', target:'>30%', status:tRev>tExp?'🟢':'🔴' },
+    { kpi:'Expense-to-Revenue Ratio',   value:tRev>0?(tExp/tRev*100).toFixed(1)+'%':'—', target:'<60%', status:tRev>0&&tExp/tRev<0.6?'🟢':'🟡' },
+    { kpi:'Total Debtors Outstanding',  value:fmtCur(latDeb), target:'<₦25M',    status:latDeb<25000000?'🟢':'🔴' }
+  ];
+  return { ratings, dynamic: dynKPIs };
+}
+
+// ── PAYABLES ───────────────────────────────────────────────────────
+function getPayables(ss) {
+  const sh = ss.getSheetByName(CONFIG.SHEETS.PAYABLES);
+  if (!sh) return { found:false, note:'Add sheet named "Accounts Payable" with columns: Date | Supplier | Invoice No | Amount | Due Date | Paid Date | Status' };
+  const vals = sh.getDataRange().getValues();
+  if (vals.length<2) return { found:true, rows:[], summary:{} };
+  const h = vals[0].map(c=>String(c).toLowerCase());
+  const ci = { amt:fci(h,'amount','value'), due:fci(h,'due date','due'), paid:fci(h,'paid date','paid'),
+    status:fci(h,'status'), supp:fci(h,'supplier','vendor'), date:fci(h,'date','invoice date') };
+  const rows=[]; let tot=0, ovd=0, due30=0; const supSet=new Set(); const today=new Date();
+  for (let i=1; i<vals.length; i++) {
+    const amt=ci.amt>=0?Number(vals[i][ci.amt])||0:0; if(amt===0) continue;
+    const paidRaw=ci.paid>=0?vals[i][ci.paid]:'';
+    if (paidRaw&&String(paidRaw).trim()!=='') continue;
+    tot+=amt;
+    const supp=ci.supp>=0?String(vals[i][ci.supp]||''):''; if(supp) supSet.add(supp);
+    let isOvd=false;
+    if (ci.due>=0&&vals[i][ci.due]) {
+      const d=new Date(vals[i][ci.due]);
+      if (!isNaN(d)) { const diff=(d-today)/864e5; if(diff<0) isOvd=true; else if(diff<=30) due30+=amt; }
+    }
+    if(isOvd) ovd+=amt;
+    rows.push({ date:ci.date>=0?String(vals[i][ci.date]||''):'', supplier:supp, amount:amt,
+      dueDate:ci.due>=0?String(vals[i][ci.due]||''):'', overdue:isOvd, status:ci.status>=0?String(vals[i][ci.status]||''):'' });
+  }
+  return { found:true, rows:rows.slice(0,30),
+    summary:{ totalOutstanding:tot, overdueAmount:ovd, dueWithin30:due30, supplierCount:supSet.size, invoiceCount:rows.length } };
+}
+
+// ── BILLING ────────────────────────────────────────────────────────
+function getBilling(ss) {
+  const sh = ss.getSheetByName(CONFIG.SHEETS.BILLING);
+  if (!sh) return { found:false, note:'Add sheet named "Billing Register" with columns: Date | Patient | Department | Amount Billed | Amount Collected | Outstanding | Status' };
+  const vals = sh.getDataRange().getValues();
+  const h = vals[0].map(c=>String(c).toLowerCase());
+  const ci = { billed:fci(h,'billed','charge'), paid:fci(h,'collected','paid'),
+    dept:fci(h,'dept','department'), status:fci(h,'status') };
+  let tB=0, tP=0, errC=0; const deptMap={}; const rows=[];
+  for (let i=1; i<vals.length; i++) {
+    const b=ci.billed>=0?Number(vals[i][ci.billed])||0:0;
+    const p=ci.paid>=0?Number(vals[i][ci.paid])||0:0;
+    if(b===0&&p===0) continue;
+    tB+=b; tP+=p;
+    const d=ci.dept>=0?String(vals[i][ci.dept]||''):'';
+    const s=ci.status>=0?String(vals[i][ci.status]||'').toLowerCase():'';
+    if(s.includes('error')||s.includes('dispute')) errC++;
+    if(d) { if(!deptMap[d]) deptMap[d]={billed:0,paid:0}; deptMap[d].billed+=b; deptMap[d].paid+=p; }
+    rows.push({ billed:b, paid:p, outstanding:b-p, dept:d, status:s });
+  }
+  return { found:true, rows:rows.slice(-30),
+    summary:{ totalBilled:tB, totalPaid:tP, outstanding:tB-tP, collectionRate:tB>0?+(tP/tB*100).toFixed(1):null, errorCount:errC, errorRate:rows.length>0?+(errC/rows.length*100).toFixed(1):0 },
+    byDept:Object.entries(deptMap).map(([d,v])=>({ dept:d, billed:v.billed, paid:v.paid, rate:v.billed>0?+(v.paid/v.billed*100).toFixed(1):null })) };
+}
+
+// ── VENDORS ────────────────────────────────────────────────────────
+function getVendors(ss) {
+  const sh = ss.getSheetByName(CONFIG.SHEETS.SRV);
+  if (!sh) return { found:false, note:'Add sheet named "SRV Report" with columns: Date | Vendor | Item | Qty | Unit Cost | Total Value | Department | SRV No' };
+  const vals = sh.getDataRange().getValues();
+  const h = vals[0].map(c=>String(c).toLowerCase());
+  const ci = { vendor:fci(h,'vendor','supplier'), val:fci(h,'total value','value','amount'),
+    dept:fci(h,'dept','department'), item:fci(h,'item','description'), date:fci(h,'date') };
+  const vendMap = {};
+  for (let i=1; i<vals.length; i++) {
+    const v=ci.vendor>=0?String(vals[i][ci.vendor]||''):''; if(!v) continue;
+    const val=ci.val>=0?Number(vals[i][ci.val])||0:0;
+    if(!vendMap[v]) vendMap[v]={ name:v, totalValue:0, deliveries:0, items:[] };
+    vendMap[v].totalValue+=val; vendMap[v].deliveries++;
+    const item=ci.item>=0?String(vals[i][ci.item]||''):'';
+    if(item&&!vendMap[v].items.includes(item)) vendMap[v].items.push(item);
+  }
+  return { found:true, vendors:Object.values(vendMap).sort((a,b)=>b.totalValue-a.totalValue).slice(0,15) };
+}
+
+// ── ASSETS ─────────────────────────────────────────────────────────
+function getAssets(ss) {
+  const sh = ss.getSheetByName(CONFIG.SHEETS.ASSETS);
+  if (!sh) return { found:false, note:'Add sheet named "Asset Register" with columns: Asset | Category | Purchase Date | Date Received | Vendor | Cost | Department | Status' };
+  const vals = sh.getDataRange().getValues();
+  const h = vals[0].map(c=>String(c).toLowerCase());
+  const ci = { asset:fci(h,'asset','description'), cat:fci(h,'category','type'),
+    pd:fci(h,'purchase'), rd:fci(h,'received'), vend:fci(h,'vendor','supplier'),
+    cost:fci(h,'cost','value'), dept:fci(h,'department','dept'), status:fci(h,'status') };
+  const rows=[]; let totalCost=0;
+  for (let i=1; i<vals.length; i++) {
+    const asset=ci.asset>=0?String(vals[i][ci.asset]||''):''; if(!asset) continue;
+    const cost=ci.cost>=0?Number(vals[i][ci.cost])||0:0;
+    totalCost+=cost;
+    rows.push({ asset, category:ci.cat>=0?String(vals[i][ci.cat]||''):'',
+      purchaseDate:ci.pd>=0?String(vals[i][ci.pd]||''):'', dateReceived:ci.rd>=0?String(vals[i][ci.rd]||''):'',
+      vendor:ci.vend>=0?String(vals[i][ci.vend]||''):'', cost,
+      department:ci.dept>=0?String(vals[i][ci.dept]||''):'', status:ci.status>=0?String(vals[i][ci.status]||'Active'):'Active' });
+  }
+  return { found:true, rows, summary:{ totalAssets:rows.length, totalValue:totalCost, active:rows.filter(r=>r.status==='Active').length } };
+}
+
+// ── ARCHIVE ────────────────────────────────────────────────────────
+function buildArchivePayload(ss, role, period) {
+  const archiveSheet = ss.getSheetByName('Report Archive') || ss.insertSheet('Report Archive');
+  const vals = archiveSheet.getDataRange().getValues();
+  const records = [];
+  for (let i=1; i<vals.length; i++) {
+    if (!vals[i][0]) continue;
+    records.push({ date:String(vals[i][0]), period:String(vals[i][1]||''),
+      revenue:Number(vals[i][2])||0, expenses:Number(vals[i][3])||0,
+      debtors:Number(vals[i][4])||0, notes:String(vals[i][5]||'') });
+  }
+  return { records, count:records.length };
+}
+
+// ── SHEET AUTO-DETECTION ───────────────────────────────────────────
+function detectSheets(ss, role) {
+  const sheets = ss.getSheets();
+  const detected = [];
+  const KNOWN_PATTERNS = [
+    { pattern:/2024/i,             type:'revenue',  label:'FY 2024 Report' },
+    { pattern:/2025/i,             type:'revenue',  label:'FY 2025 Report' },
+    { pattern:/2026/i,             type:'revenue',  label:'FY 2026 Report' },
+    { pattern:/debtor/i,           type:'debtors',  label:'Debtors Tracker' },
+    { pattern:/store|inventory/i,  type:'store',    label:'Store & Inventory' },
+    { pattern:/payable|creditor/i, type:'payables', label:'Accounts Payable' },
+    { pattern:/cashbook|cash book/i,type:'cashbook',label:'Cashbook' },
+    { pattern:/billing|invoice/i,  type:'billing',  label:'Billing Register' },
+    { pattern:/srv|receipt voucher/i,type:'vendors',label:'SRV Report' },
+    { pattern:/asset/i,            type:'assets',   label:'Asset Register' },
+    { pattern:/kpi|scorecard/i,    type:'kpi',      label:'KPI Scorecard' },
+    { pattern:/oxygen|consumption/i,type:'store',   label:'Oxygen Consumption' },
+    { pattern:/inpatient|outstanding/i,type:'debtors',label:'Inpatient Outstanding' },
+    { pattern:/patient monitor/i,  type:'debtors',  label:'Patient Monitor' },
+    { pattern:/hmo|insurance/i,    type:'billing',  label:'HMO Tracker' },
+    { pattern:/pharmacy|pharma/i,  type:'store',    label:'Pharmacy Report' },
+    { pattern:/radiology/i,        type:'revenue',  label:'Radiology Tracker' },
+  ];
+  sheets.forEach(sh => {
+    const name  = sh.getName();
+    const match = KNOWN_PATTERNS.find(p => p.pattern.test(name));
+    detected.push({ name, type:match?match.type:'unknown', label:match?match.label:name,
+      rows:sh.getLastRow(), cols:sh.getLastColumn(),
+      url:`https://docs.google.com/spreadsheets/d/${ss.getId()}/edit#gid=${sh.getSheetId()}` });
+  });
+  return { sheets:detected, total:detected.length, timestamp:new Date().toISOString() };
+}
+
+// ── AUDIT LOGGING ─────────────────────────────────────────────────
+function logAudit(role, action, target) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sh = ss.getSheetByName(CONFIG.AUDIT_SHEET);
+    if (!sh) { sh=ss.insertSheet(CONFIG.AUDIT_SHEET); sh.appendRow(['Timestamp','Role','Action','Target','Session']); }
+    sh.appendRow([new Date().toISOString(), role, action, target||'', 'dashboard']);
+    if (sh.getLastRow()>10000) sh.deleteRows(2,100);
+  } catch(e) {}
+}
+
+// ── UTILITIES ─────────────────────────────────────────────────────
+function findRow(vals, text, col) {
+  for (let i=0; i<vals.length; i++) if (String(vals[i][col]||'').toUpperCase().includes(text.toUpperCase())) return i;
+  return -1;
+}
+function numSlice(row, start, end) { return row.slice(start,end).map(v=>Number(v)||0); }
+function fci(headers, ...keys) { for(const k of keys) { const i=headers.findIndex(h=>h.includes(k)); if(i>=0) return i; } return -1; }
+function fmtCur(n) { if(n>=1e9) return '₦'+(n/1e9).toFixed(2)+'B'; if(n>=1e6) return '₦'+(n/1e6).toFixed(1)+'M'; if(n>=1e3) return '₦'+(n/1e3).toFixed(0)+'K'; return '₦'+Math.round(n); }
+
+// ── DAILY AUTO-BACKUP (trigger: set to run daily) ─────────────────
+function dailyBackup() {
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  const snap = ss.getSheetByName('Report Archive') || ss.insertSheet('Report Archive');
+  const rev  = getRevenueData(ss, '2025');
+  const mo   = rev['2025']?.monthly || [];
+  const ex   = rev['2025']?.expenses || [];
+  const deb  = getDebtors(ss);
+  snap.appendRow([new Date().toISOString(), 'Monthly', mo.reduce((a,b)=>a+b,0),
+    ex.reduce((a,b)=>a+b,0), deb.latest||0, 'Auto-backup']);
+}
